@@ -1,0 +1,1134 @@
+---
+title: "PL4246 Final Report — STARS Network Analysis"
+author: "Andre Liang Junfeng (A0253130X)"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+# ── Global chunk options ────────────────────────────────────────────────────
+# echo    = TRUE  : show all code in the rendered HTML
+# message = FALSE : suppress package-loading messages (keeps output tidy)
+# warning = FALSE : suppress warnings (e.g. from igraph / bootnet)
+# fig.*           : consistent figure dimensions and resolution throughout
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.align  = "center",
+  fig.width  = 7,
+  fig.height = 5,
+  dpi        = 150
+)
+```
+
+# Overview
+
+This notebook reproduces every analysis reported in the PL4246 final paper:
+
+> *Within a partial-correlation network of STARS items, do Computation
+> Self-Concept nodes act as structural bridges — as indicated by betweenness
+> centrality and bridge centrality — between the Fear of Statistics Teachers
+> and Fear of Asking for Help domains?*
+
+**Pipeline summary** (one section per step):
+
+1. **Network construction** — partial-correlation network, significance-thresholded.
+2. **Macro-level descriptives** — density, clustering, ASPL; comparison against an Erdős–Rényi null.
+3. **Domain-level descriptives** — size and mean degree per STARS domain.
+4. **Node-level centrality** — weighted betweenness + bridge centrality (Jones et al., 2021).
+5. **Domain comparison** — assumption checks, label-permutation tests, Mann–Whitney U backup.
+6. **Robustness checks** — edge-weight bootstrap and case-drop CS-coefficients (bootnet).
+7. **Figures** — all visualisations saved to `figures/` and rendered inline.
+8. **Save outputs** — network objects, centrality tables, and session info saved to `output/` and `tables/`.
+
+**How to run:**  
+All file paths are *relative* to this `.Rmd` file.  
+In RStudio, go to **Session → Set Working Directory → To Source File Location** before knitting,
+or use `setwd()` to point at the folder containing this file and `stars-data_132_nodes_added.csv`.
+
+---
+
+# Libraries and reproducibility
+
+```{r libraries}
+# ── Required packages ───────────────────────────────────────────────────────
+# Install any missing packages with: install.packages("pkg_name")
+#
+# bootnet      : estimateNetwork() — partial-correlation network estimation
+# qgraph       : underlying network object used by networktools
+# igraph       : graph object creation, centrality measures
+# networktools : bridge() — bridge centrality (Jones, Ma, & McNally, 2021)
+# tidyverse    : data wrangling (dplyr, tidyr) and plotting (ggplot2)
+# car          : leveneTest() — variance-equality check for assumption testing
+
+library(bootnet)        # estimateNetwork()
+library(qgraph)         # network object used by networktools
+library(igraph)         # graph object, centrality
+library(networktools)   # bridge() -- Jones, Ma, & McNally (2021)
+library(tidyverse)      # data wrangling + ggplot2
+library(car)            # leveneTest() for assumption checks
+
+# A single seed governs ALL stochastic steps (permutation tests, ER
+# simulation, bootnet bootstraps, and FR layout) so results are exactly
+# reproducible across runs and machines.
+set.seed(4246)
+```
+
+---
+
+# Data and network construction
+
+## Load and prepare the data
+
+```{r load-data}
+# ── Load data ───────────────────────────────────────────────────────────────
+# File: stars-data_132_nodes_added.csv
+#   • 132 rows  = respondents (NUS psychology undergraduates, semesters 2023–2026)
+#   • 51 columns (after selection) = STARS item responses on a 5-point Likert scale
+#
+# Path is relative to this .Rmd file — no absolute paths needed.
+# If the file is missing, confirm the working directory matches the .Rmd location.
+data <- read.csv("stars-data_132_nodes_added.csv", header = TRUE)
+
+# Retain only the 51 STARS item columns (study … too_slow).
+# Demographic columns (gender, year_of_study, etc.) are not used in this analysis.
+data <- data |> select(study:too_slow)
+
+dim(data)   # expected output: 132 rows x 51 columns
+```
+
+## Estimate the partial-correlation network
+
+```{r estimate-network}
+# ── Network estimation ──────────────────────────────────────────────────────
+# Method: partial correlations (default = "pcor")
+#   Each edge weight is the partial correlation between two STARS items after
+#   controlling for all other items in the network. This removes shared variance
+#   due to third variables, giving a more conservative estimate of direct
+#   associations than zero-order correlations (Epskamp et al., 2018).
+#
+# Thresholding: threshold = "sig"
+#   Retains only edges whose partial correlation is statistically significant
+#   at p < .05. At n/p ≈ 2.6 (132 respondents / 51 items), the network is
+#   intentionally sparse — treat all results as descriptive of this sample.
+#
+# Note on n/p ratio: the low ratio means that adding or removing a handful of
+#   respondents can noticeably change the estimated matrix. The robustness
+#   section (Section 7) quantifies this instability via CS-coefficients.
+
+stars_matrix <- estimateNetwork(
+  data,
+  default   = "pcor",
+  threshold = "sig"
+)
+
+# Extract the weighted, SIGNED adjacency matrix (rows/cols = STARS items).
+# This signed matrix is passed to networktools::bridge() later because
+# bridge expected influence requires edge signs.
+stars_adj_mat <- stars_matrix$graph
+```
+
+## Build the igraph object
+
+Following the course workflow (Siew, 2026, Chapter 13), we **absolutise** the
+adjacency matrix before converting to igraph. Several igraph centrality
+functions (e.g., `betweenness`) treat edge weights as distances or strengths;
+negative values can produce undefined or misleading results in those contexts.
+The signed matrix is kept separately for bridge centrality (see Section 5).
+
+```{r build-igraph}
+# ── Absolutise adjacency matrix ─────────────────────────────────────────────
+# Negative partial correlations arise because controlling for shared variance
+# can suppress or reverse apparent associations — this is expected in pcor
+# networks. For igraph path-length calculations we use absolute values so that
+# all edges represent association strength (not sign) in distance computations.
+stars_adj_mat_abs <- abs(stars_adj_mat)
+
+# ── Convert to undirected weighted igraph object ─────────────────────────────
+# mode = "undirected" : STARS is a cross-sectional survey; no directionality.
+# weighted = TRUE     : edge weights carry the partial-correlation magnitude.
+# diag = FALSE        : no self-loops (diagonal of adjacency matrix = 0).
+g <- graph_from_adjacency_matrix(
+  stars_adj_mat_abs,
+  mode     = "undirected",
+  weighted = TRUE,
+  diag     = FALSE
+)
+
+# ── Sanity checks ────────────────────────────────────────────────────────────
+summary(g)          # should show: weighted undirected, 51 nodes, 130 edges
+
+ecount(g)           # expected: 130 total edges
+
+# Count positive vs. negative edges in the original signed matrix.
+# Each undirected edge appears twice in the matrix (upper + lower triangle),
+# so divide by 2 for unique edge counts.
+sum(stars_adj_mat > 0)   # 184 cells → 92 unique positive edges
+sum(stars_adj_mat < 0)   # 76  cells → 38 unique negative edges
+
+# The network must form a single connected component for betweenness and
+# shortest-path metrics to be well-defined across all node pairs.
+components(g)$no         # expected: 1 (one connected component)
+```
+
+## Assign STARS domains
+
+```{r assign-domains}
+# ── Map item indices to STARS domains ────────────────────────────────────────
+# Domain assignments follow the original scale structure (Cruise et al., 1985).
+# Item indices refer to column positions in the 51-item data frame, which
+# correspond to the item numbers in the STARS scale.
+#
+# Domain labels (6 total):
+#   TCA = Test and Class Anxiety         (8 items)
+#   IA  = Interpretation Anxiety        (11 items)
+#   FAH = Fear of Asking for Help        (4 items)
+#   WS  = Worth of Statistics           (16 items)
+#   CSC = Computation Self-Concept       (7 items)  ← focal domain
+#   FST = Fear of Statistics Teachers   (5 items)
+
+test_class_anx     <- c(1, 4, 8, 10, 13, 15, 21, 22)
+interpretation_anx <- c(2, 5, 6, 7, 9, 11, 12, 14, 17, 18, 20)
+fear_help          <- c(3, 16, 19, 23)
+worth_stat         <- c(24, 26, 27, 28, 29, 33, 35, 36, 37,
+                        40, 41, 42, 45, 47, 49, 50)
+comp_self          <- c(25, 31, 34, 38, 39, 48, 51)  # item 51 = "too slow" (focal CSC node)
+fear_teacher       <- c(30, 32, 43, 44, 46)
+
+# Build a character vector of length 51 mapping each item to its domain name.
+domains <- rep(NA_character_, 51)
+domains[test_class_anx]     <- "Test and Class Anxiety"
+domains[interpretation_anx] <- "Interpretation Anxiety"
+domains[fear_help]          <- "Fear of Asking for Help"
+domains[worth_stat]         <- "Worth of Statistics"
+domains[comp_self]          <- "Computation Self-Concept"
+domains[fear_teacher]       <- "Fear of Statistics Teachers"
+
+# Attach domain labels as a vertex attribute in the igraph object.
+V(g)$domain <- domains
+
+# Guard: every node must have a domain label before proceeding.
+stopifnot(!any(is.na(V(g)$domain)))
+
+# Verify item counts per domain (should match the numbers in parentheses above).
+table(V(g)$domain)
+```
+
+## Convert edge weights to distances
+
+```{r edge-distances}
+# ── Invert weights to get distances ─────────────────────────────────────────
+# igraph's betweenness() and mean_distance() interpret the 'weights' argument
+# as distances (larger = farther apart). However, partial correlations encode
+# strength (larger = more closely associated).
+#
+# Inversion d = 1/w maps strong associations → short distances and weak
+# associations → long distances (Siew, 2026, Ch. 4).
+# Weights are already absolutised, so d is always positive.
+E(g)$distance <- 1 / E(g)$weight
+```
+
+---
+
+# Macro-level network measures
+
+```{r macro-results}
+# ── Compute macro-level descriptors ─────────────────────────────────────────
+# These characterise the overall network topology and are reported in Table 1
+# of the paper.
+#
+# ASPL_weighted   : uses d = 1/|w| distances (strong ties = short paths)
+# ASPL_unweighted : treats all present edges as distance = 1 (hop count)
+# global_clustering : fraction of node triples that form closed triangles
+# domain_assortativity : tendency for nodes to connect within their own domain
+#   (> 0 = within-domain edges predominate; reported as 0.19 in the paper)
+
+macro_results <- tibble(
+  nodes                = vcount(g),
+  edges                = ecount(g),
+  density              = edge_density(g),
+  avg_degree           = mean(degree(g)),
+  ASPL_weighted        = mean_distance(g, weights = E(g)$distance),
+  ASPL_unweighted      = mean_distance(g, weights = NA),
+  global_clustering    = transitivity(g, type = "global"),
+  diameter_weighted    = diameter(g, weights = E(g)$distance),
+  degree_assortativity = assortativity_degree(g),
+  domain_assortativity = assortativity_nominal(
+    g, types = as.factor(V(g)$domain), directed = FALSE
+  )
+)
+macro_results
+```
+
+## Comparison against an Erdős–Rényi null
+
+To assess whether the observed clustering and path length depart from random,
+we simulate 1,000 Erdős–Rényi (ER) networks matched on node count (n = 51)
+and edge count (m = 130). A psychometric network with higher clustering *and*
+comparable ASPL relative to the ER null is said to exhibit the small-world
+property (Borsboom & Cramer, 2013). The results of this comparison are
+summarised in Table 3 of the paper.
+
+```{r er-baseline, cache=TRUE}
+# ── Erdős–Rényi null simulation ──────────────────────────────────────────────
+# sample_gnm() generates a random graph with exactly n nodes and m edges
+# (G(n,m) model). Each replicate computes unweighted ASPL and global
+# clustering so we can build an empirical null distribution for both.
+#
+# cache = TRUE: this chunk is slow (~30 s). R Markdown will skip re-running
+# it on subsequent knits if none of its inputs have changed.
+
+n_reps  <- 1000
+n_nodes <- vcount(g)   # 51
+n_edges <- ecount(g)   # 130
+
+set.seed(4246)
+er_stats <- replicate(n_reps, {
+  g_er <- sample_gnm(n = n_nodes, m = n_edges, directed = FALSE)
+  c(
+    aspl       = mean_distance(g_er, weights = NA),
+    clustering = transitivity(g_er, type = "global")
+  )
+})
+
+# Observed values for the STARS network (unweighted, for comparability with ER)
+obs_aspl       <- mean_distance(g, weights = NA)
+obs_clustering <- transitivity(g, type = "global")
+
+# One-tailed p-values:
+#   For ASPL      : proportion of ER networks with ASPL >= observed
+#                   (test: is observed ASPL unusually HIGH?)
+#   For clustering: proportion of ER networks with clustering >= observed
+#                   (test: is observed clustering unusually HIGH?)
+baseline_results <- tibble(
+  measure    = c("ASPL (unweighted)", "Global clustering"),
+  observed   = c(obs_aspl, obs_clustering),
+  er_mean    = c(mean(er_stats["aspl", ]), mean(er_stats["clustering", ])),
+  er_sd      = c(sd(er_stats["aspl", ]),   sd(er_stats["clustering", ])),
+  p_one_tail = c(
+    mean(er_stats["aspl", ]       >= obs_aspl),
+    mean(er_stats["clustering", ] >= obs_clustering)
+  )
+)
+
+# Standardised effect size: (observed - null mean) / null SD, analogous to z.
+# Positive values mean the observed measure exceeds the ER expectation.
+er_effect_sizes <- tibble(
+  measure = c("ASPL (unweighted)", "Global clustering"),
+  observed = c(obs_aspl, obs_clustering),
+  er_mean  = c(mean(er_stats["aspl", ]),       mean(er_stats["clustering", ])),
+  er_sd    = c(sd(er_stats["aspl", ]),         sd(er_stats["clustering", ])),
+  p_one_tail = c(
+    mean(er_stats["aspl", ]       >= obs_aspl),
+    mean(er_stats["clustering", ] >= obs_clustering)
+  )
+) |>
+  mutate(effect_size_z = (observed - er_mean) / er_sd)
+
+er_effect_sizes
+```
+
+The elevated clustering relative to the ER null (observed C = 0.22 vs.
+ER mean ≈ 0.10, p < .001) is consistent with the within-domain cohesion
+expected from a psychometric scale (Borsboom & Cramer, 2013). However, ASPL
+also exceeded the ER mean (p = .001), indicating the network does not display
+the classic small-world signature; significance thresholding created uneven
+sparsity where some domains are linked only through single bridging edges.
+
+---
+
+# Domain-level descriptives
+
+```{r domain-summary}
+# ── Degree distribution per STARS domain ─────────────────────────────────────
+# Summarises how connected nodes are on average within each domain.
+# Mean degree for each domain is one indicator of how embedded items
+# are in the overall network structure. These values feed into Table 2.
+#
+# Arranged descending by mean degree so the most-connected domain appears first.
+domain_summary <- tibble(
+  domain = V(g)$domain,
+  degree = degree(g)
+) |>
+  group_by(domain) |>
+  summarise(
+    n_nodes     = n(),
+    mean_degree = mean(degree),
+    sd_degree   = sd(degree),
+    .groups     = "drop"
+  ) |>
+  arrange(desc(mean_degree))
+domain_summary
+```
+
+---
+
+# Node-level centrality
+
+## Betweenness centrality
+
+Weighted, normalised betweenness centrality: the proportion of shortest
+paths between all other pairs of nodes that pass through a given node
+(Siew, 2026, Ch. 7). A node with high betweenness acts as a bottleneck or
+structural bridge in the network. We use `weights = E(g)$distance` (inverted
+weights) so that strong correlations correspond to short, preferred paths.
+Normalisation (0–1 scale) allows comparison across networks of different sizes.
+
+```{r betweenness}
+# ── Weighted normalised betweenness ──────────────────────────────────────────
+# weights argument takes DISTANCES (not strengths), hence E(g)$distance = 1/w.
+# normalized = TRUE divides by the maximum possible betweenness for a graph of
+# this size, placing values on a 0–1 scale.
+btw <- betweenness(
+  g,
+  weights    = E(g)$distance,
+  normalized = TRUE,
+  directed   = FALSE
+)
+```
+
+## Bridge centrality (Jones, Ma, & McNally, 2021)
+
+`networktools::bridge()` quantifies how much each node connects *outside* its
+own community (domain). Four bridge measures are returned:
+
+- **Bridge strength**: sum of absolute edge weights from a node to nodes in
+  other domains — the primary measure (most stable in psychometric networks;
+  Jones et al., 2021).
+- **Bridge betweenness**: counts how often a node lies on the shortest path
+  *between* communities — used here as a convergent check.
+- **Bridge closeness** and **Bridge expected influence (1-step)**: reported
+  in the centrality table but not the primary focus.
+
+```{r bridge-centrality}
+# ── Prepare community vector ─────────────────────────────────────────────────
+# bridge() requires a character vector of length = n_nodes where each element
+# is the community label for the corresponding node, in the SAME ORDER as the
+# rows/columns of the adjacency matrix supplied to it.
+community_vec <- V(g)$domain
+
+# ── Align row/column names ───────────────────────────────────────────────────
+# bridge() uses rownames and colnames to match nodes; if these are NULL or
+# inconsistent, the function throws a dimension-mismatch error.
+# This block ensures names are set correctly regardless of how bootnet
+# returned the adjacency matrix.
+node_names <- rownames(stars_adj_mat)
+if (is.null(node_names)) node_names <- colnames(stars_adj_mat)
+if (is.null(node_names)) node_names <- V(g)$name
+rownames(stars_adj_mat) <- colnames(stars_adj_mat) <- node_names
+
+# Guard: node names in the igraph object and the adjacency matrix must match.
+stopifnot(setequal(V(g)$name, colnames(stars_adj_mat)))
+stopifnot(length(community_vec) == ncol(stars_adj_mat))
+
+# ── Compute bridge centrality ────────────────────────────────────────────────
+# We pass the SIGNED adjacency matrix (stars_adj_mat, not absolutised) because
+# bridge expected influence explicitly uses edge signs to model the net effect
+# of a node's cross-community connections (Jones et al., 2021).
+bridge_results <- bridge(
+  network        = stars_adj_mat,      # signed: bridge EI requires signs
+  communities    = community_vec,
+  useCommunities = "all",
+  directed       = FALSE,
+  nodes          = NULL
+)
+
+# Extract each bridge measure as a named numeric vector (length = 51).
+bridge_strength  <- bridge_results$`Bridge Strength`
+bridge_betw      <- bridge_results$`Bridge Betweenness`
+bridge_closeness <- bridge_results$`Bridge Closeness`
+bridge_ei1       <- bridge_results$`Bridge Expected Influence (1-step)`
+```
+
+## Tidy centrality table
+
+```{r centrality-table}
+# ── Combine all node-level measures into one tibble ──────────────────────────
+# This table is saved to tables/Table4_node_centrality.csv (Section 8) and
+# is used downstream for permutation tests and figures.
+#
+# Column key:
+#   node             : item label (matches V(g)$name)
+#   domain           : STARS domain assignment
+#   degree           : number of edges (unweighted)
+#   betweenness      : normalised weighted betweenness (d = 1/w)
+#   bridge_strength  : PRIMARY bridge measure — sum |w| to other-domain nodes
+#   bridge_betw      : bridge betweenness — inter-community shortest-path count
+#   bridge_closeness : bridge closeness centrality
+#   bridge_ei1       : bridge expected influence (1-step, signed)
+
+centrality_tbl <- tibble(
+  node             = V(g)$name,
+  domain           = V(g)$domain,
+  degree           = degree(g),
+  betweenness      = as.numeric(btw),
+  bridge_strength  = as.numeric(bridge_strength),
+  bridge_betw      = as.numeric(bridge_betw),
+  bridge_closeness = as.numeric(bridge_closeness),
+  bridge_ei1       = as.numeric(bridge_ei1)
+)
+
+# ── Quick inspection: top nodes on the two primary measures ──────────────────
+# The most central nodes should be visually prominent in Figure 1 panels b & c.
+# In the submitted paper, item t_s ("too slow", CSC) ranks first on both.
+
+# Top 10 by bridge strength (primary bridge measure)
+centrality_tbl |>
+  arrange(desc(bridge_strength)) |>
+  head(10)
+
+# Top 10 by betweenness (general network centrality)
+centrality_tbl |>
+  arrange(desc(betweenness)) |>
+  head(10)
+```
+
+---
+
+# Domain-level comparisons
+
+## Descriptive means per domain
+
+```{r domain-centrality}
+# ── Aggregate centrality measures by STARS domain ────────────────────────────
+# Produces Table 2 in the paper: mean degree, betweenness, bridge strength,
+# and bridge betweenness per domain.
+#
+# Arranged descending by mean bridge strength so the highest-bridging domain
+# (Computation Self-Concept) appears at the top.
+
+domain_centrality <- centrality_tbl |>
+  group_by(domain) |>
+  summarise(
+    n              = n(),
+    mean_btw       = mean(betweenness),
+    mean_bstrength = mean(bridge_strength),
+    mean_bbetween  = mean(bridge_betw),
+    .groups        = "drop"
+  ) |>
+  arrange(desc(mean_bstrength))
+domain_centrality
+```
+
+## Assumption tests
+
+Before choosing between a parametric t-test and a permutation test, we check
+two key assumptions: normality (Shapiro–Wilk) and variance equality (Levene).
+These are reported in the Methods section of the paper as the justification
+for using a label-permutation test.
+
+```{r assumption-tests}
+# ── Shapiro–Wilk normality tests ─────────────────────────────────────────────
+# Tested on: (a) the full 51-node distribution, and (b) the CSC subgroup (n=7).
+# Significant departures from normality (p < .05) in either group violate the
+# normality assumption required for a parametric t-test.
+#
+# Reported in the paper: Ws = 0.78–0.93, all ps < .01 for the full distribution;
+# betweenness and bridge betweenness also violated normality within CSC.
+
+normality_checks <- tibble(
+  measure = c("Betweenness", "Bridge Strength", "Bridge Betweenness"),
+
+  # Full distribution (all 51 nodes)
+  W_full = c(
+    shapiro.test(centrality_tbl$betweenness)$statistic,
+    shapiro.test(centrality_tbl$bridge_strength)$statistic,
+    shapiro.test(centrality_tbl$bridge_betw)$statistic
+  ),
+  p_full = c(
+    shapiro.test(centrality_tbl$betweenness)$p.value,
+    shapiro.test(centrality_tbl$bridge_strength)$p.value,
+    shapiro.test(centrality_tbl$bridge_betw)$p.value
+  ),
+
+  # CSC subgroup only (n = 7)
+  W_csc = c(
+    shapiro.test(centrality_tbl$betweenness[centrality_tbl$domain == "Computation Self-Concept"])$statistic,
+    shapiro.test(centrality_tbl$bridge_strength[centrality_tbl$domain == "Computation Self-Concept"])$statistic,
+    shapiro.test(centrality_tbl$bridge_betw[centrality_tbl$domain == "Computation Self-Concept"])$statistic
+  ),
+  p_csc = c(
+    shapiro.test(centrality_tbl$betweenness[centrality_tbl$domain == "Computation Self-Concept"])$p.value,
+    shapiro.test(centrality_tbl$bridge_strength[centrality_tbl$domain == "Computation Self-Concept"])$p.value,
+    shapiro.test(centrality_tbl$bridge_betw[centrality_tbl$domain == "Computation Self-Concept"])$p.value
+  )
+)
+
+normality_checks
+
+# ── Visual inspection: distribution shape ────────────────────────────────────
+# Histograms for all three centrality measures reveal the right-skewed
+# distributions that further justify the non-parametric approach.
+par(mfrow = c(1, 3))
+
+hist(centrality_tbl$betweenness,
+     main = "Betweenness", xlab = "Value",
+     col = "lightblue", breaks = 15)
+
+hist(centrality_tbl$bridge_strength,
+     main = "Bridge Strength", xlab = "Value",
+     col = "lightblue", breaks = 15)
+
+hist(centrality_tbl$bridge_betw,
+     main = "Bridge Betweenness", xlab = "Value",
+     col = "lightblue", breaks = 15)
+
+par(mfrow = c(1, 1))
+
+# ── Levene's test: equality of variances ─────────────────────────────────────
+# Tests whether the CSC group and the rest of the nodes have equal variance on
+# each centrality measure — a second assumption required for a standard t-test.
+# If violated, this provides additional justification for the permutation approach.
+
+# Create a binary grouping variable: CSC vs. all other domains
+centrality_tbl <- centrality_tbl |>
+  mutate(is_csc = ifelse(domain == "Computation Self-Concept", "CSC", "Other"))
+
+levene_results <- tibble(
+  measure = c("Betweenness", "Bridge Strength", "Bridge Betweenness"),
+  F_stat = c(
+    leveneTest(betweenness     ~ is_csc, data = centrality_tbl)$`F value`[1],
+    leveneTest(bridge_strength ~ is_csc, data = centrality_tbl)$`F value`[1],
+    leveneTest(bridge_betw     ~ is_csc, data = centrality_tbl)$`F value`[1]
+  ),
+  p_value = c(
+    leveneTest(betweenness     ~ is_csc, data = centrality_tbl)$`Pr(>F)`[1],
+    leveneTest(bridge_strength ~ is_csc, data = centrality_tbl)$`Pr(>F)`[1],
+    leveneTest(bridge_betw     ~ is_csc, data = centrality_tbl)$`Pr(>F)`[1]
+  )
+)
+
+levene_results
+```
+
+## Permutation test: Computation Self-Concept vs. rest
+
+A label-permutation test was chosen over a parametric t-test for three reasons:
+the CSC group is small (n = 7), Shapiro–Wilk tests showed normality violations
+across all three measures, and the permutation framework directly operationalises
+the null hypothesis of interest — that domain labels are exchangeable with
+respect to centrality. The implementation follows Marin (2019).
+
+The test asks: if domain membership is irrelevant, how often would we observe
+a mean-difference at least as large as the one we actually found?
+
+```{r permutation-test, cache=TRUE}
+# ── Label-permutation test function ──────────────────────────────────────────
+# Arguments:
+#   values       : numeric vector of centrality scores (length = n_nodes = 51)
+#   group_labels : character vector of domain labels (same length as values)
+#   target_label : the focal domain to compare against all others ("Computation
+#                  Self-Concept" in this analysis)
+#   n_perm       : number of permutations (10,000; Marin, 2019)
+#
+# Returns a list with the observed mean difference, two-tailed p-value,
+# and null distribution statistics.
+#
+# Two-tailed p-value: proportion of null differences whose absolute value is
+# at least as large as the absolute observed difference.
+
+permutation_test <- function(values, group_labels, target_label,
+                             n_perm = 10000) {
+  obs_diff <- mean(values[group_labels == target_label]) -
+              mean(values[group_labels != target_label])
+
+  perm_diffs <- replicate(n_perm, {
+    shuffled <- sample(group_labels)
+    mean(values[shuffled == target_label]) -
+      mean(values[shuffled != target_label])
+  })
+
+  p_val <- mean(abs(perm_diffs) >= abs(obs_diff))
+
+  list(
+    observed_difference = obs_diff,
+    p_value             = p_val,
+    n_permutations      = n_perm,
+    null_mean           = mean(perm_diffs),
+    null_sd             = sd(perm_diffs)
+  )
+}
+
+# ── Run permutation tests for each centrality measure ────────────────────────
+# cache = TRUE: permutation tests are slow (10,000 iterations × 3 measures).
+# Results in the paper: bridge betweenness p = .012 (significant);
+# betweenness p = .134 and bridge strength p = .131 (non-significant).
+
+perm_btw <- permutation_test(
+  centrality_tbl$betweenness,
+  centrality_tbl$domain,
+  "Computation Self-Concept"
+)
+perm_bstrength <- permutation_test(
+  centrality_tbl$bridge_strength,
+  centrality_tbl$domain,
+  "Computation Self-Concept"
+)
+perm_bbetween <- permutation_test(
+  centrality_tbl$bridge_betw,
+  centrality_tbl$domain,
+  "Computation Self-Concept"
+)
+
+# ── Summary table (Table 3 in paper) ─────────────────────────────────────────
+tibble(
+  measure       = c("Betweenness", "Bridge Strength", "Bridge Betweenness"),
+  observed_diff = c(perm_btw$observed_difference,
+                    perm_bstrength$observed_difference,
+                    perm_bbetween$observed_difference),
+  p_value       = c(perm_btw$p_value,
+                    perm_bstrength$p_value,
+                    perm_bbetween$p_value)
+)
+
+# ── Effect sizes: Cohen's d (supplementary) ───────────────────────────────────
+# Pooled-SD Cohen's d for unequal group sizes (CSC n=7, rest n=44).
+# Reported alongside permutation results as a standardised effect size.
+cohens_d <- function(values, group_labels, target_label) {
+  g1 <- values[group_labels == target_label]
+  g2 <- values[group_labels != target_label]
+  n1 <- length(g1); n2 <- length(g2)
+  pooled_sd <- sqrt(((n1 - 1) * var(g1) + (n2 - 1) * var(g2)) / (n1 + n2 - 2))
+  (mean(g1) - mean(g2)) / pooled_sd
+}
+
+tibble(
+  measure = c("Betweenness", "Bridge Strength", "Bridge Betweenness"),
+  observed_diff = c(perm_btw$observed_difference,
+                    perm_bstrength$observed_difference,
+                    perm_bbetween$observed_difference),
+  p_value = c(perm_btw$p_value,
+              perm_bstrength$p_value,
+              perm_bbetween$p_value),
+  cohens_d = c(
+    cohens_d(centrality_tbl$betweenness,    centrality_tbl$domain, "Computation Self-Concept"),
+    cohens_d(centrality_tbl$bridge_strength, centrality_tbl$domain, "Computation Self-Concept"),
+    cohens_d(centrality_tbl$bridge_betw,    centrality_tbl$domain, "Computation Self-Concept")
+  )
+)
+```
+
+## Mann–Whitney U test (convergent check)
+
+A Mann–Whitney U test is included as a non-parametric convergent check.
+It is *not* the primary test (the permutation test is) because it evaluates
+rank distributions rather than mean differences, which is the direct quantity
+of interest. Both tests lead to the same substantive conclusions.
+
+```{r mann_whitney_u-test, cache=TRUE}
+# ── Mann–Whitney U tests: CSC vs. rest ───────────────────────────────────────
+# Two-sided tests; exact = FALSE because of ties in ranked data.
+# Effect size: rank-biserial correlation r — analogous to Cohen's d for
+# nonparametric tests. r > 0 indicates CSC ranks higher than the rest.
+
+mw_btw <- wilcox.test(
+  centrality_tbl$betweenness[centrality_tbl$domain == "Computation Self-Concept"],
+  centrality_tbl$betweenness[centrality_tbl$domain != "Computation Self-Concept"],
+  alternative = "two.sided",
+  exact = FALSE
+)
+
+mw_bstrength <- wilcox.test(
+  centrality_tbl$bridge_strength[centrality_tbl$domain == "Computation Self-Concept"],
+  centrality_tbl$bridge_strength[centrality_tbl$domain != "Computation Self-Concept"],
+  alternative = "two.sided",
+  exact = FALSE
+)
+
+mw_bbetween <- wilcox.test(
+  centrality_tbl$bridge_betw[centrality_tbl$domain == "Computation Self-Concept"],
+  centrality_tbl$bridge_betw[centrality_tbl$domain != "Computation Self-Concept"],
+  alternative = "two.sided",
+  exact = FALSE
+)
+
+# ── Rank-biserial correlation (effect size) ───────────────────────────────────
+# Formula: r = (U1 - U2) / (n1 * n2)
+# where U1 = Wilcoxon statistic for CSC vs rest, U2 = n1*n2 - U1
+# r > 0: CSC has higher ranks (stronger centrality) than the rest.
+n1 <- sum(centrality_tbl$domain == "Computation Self-Concept")  # n = 7
+n2 <- sum(centrality_tbl$domain != "Computation Self-Concept")  # n = 44
+
+rank_biserial_correct <- function(U, n1, n2) {
+  U2 <- n1 * n2 - U
+  (U - U2) / (n1 * n2)
+}
+
+tibble(
+  measure       = c("Betweenness", "Bridge Strength", "Bridge Betweenness"),
+  U             = c(mw_btw$statistic, mw_bstrength$statistic, mw_bbetween$statistic),
+  p_value       = c(mw_btw$p.value,   mw_bstrength$p.value,   mw_bbetween$p.value),
+  rank_biserial = rank_biserial_correct(
+    c(mw_btw$statistic, mw_bstrength$statistic, mw_bbetween$statistic),
+    n1, n2
+  )
+)
+```
+
+## Direct edge counts between CSC and the two interpersonal domains
+
+```{r direct-edges}
+# ── Descriptive adjacency check ───────────────────────────────────────────────
+# Tests the specific mechanistic hypothesis from the paper: does CSC sit between
+# Fear of Statistics Teachers (FST) and Fear of Asking for Help (FAH)?
+#
+# We count direct edges (non-zero adjacency entries) between each pair of domains.
+# If CSC connects to both FST and FAH while FST and FAH connect little to each
+# other, that is face-valid structural evidence for a bridging role.
+#
+# Reported in the paper:
+#   CSC–FST: 5 direct edges (out of 7 × 5 = 35 possible)
+#   CSC–FAH: 2 direct edges (out of 7 × 4 = 28 possible)
+#   FST–FAH: 1 direct edge  (out of 5 × 4 = 20 possible)
+
+csc_nodes <- V(g)$name[V(g)$domain == "Computation Self-Concept"]
+fst_nodes  <- V(g)$name[V(g)$domain == "Fear of Statistics Teachers"]
+fah_nodes  <- V(g)$name[V(g)$domain == "Fear of Asking for Help"]
+
+# Count non-zero entries in each inter-domain submatrix.
+# Using the absolutised matrix so that negative edges are also counted.
+csc_fst_edges <- sum(stars_adj_mat_abs[csc_nodes, fst_nodes] > 0)
+csc_fah_edges <- sum(stars_adj_mat_abs[csc_nodes, fah_nodes] > 0)
+fst_fah_edges <- sum(stars_adj_mat_abs[fst_nodes, fah_nodes] > 0)
+
+tibble(
+  connection         = c("CSC — FST", "CSC — FAH", "FST — FAH (direct)"),
+  n_edges            = c(csc_fst_edges, csc_fah_edges, fst_fah_edges)
+)
+```
+
+---
+
+# Network robustness checks
+
+Psychometric networks are estimated from data and therefore carry uncertainty.
+The bootnet package (Epskamp et al., 2018) provides two complementary
+assessments: a non-parametric bootstrap for **edge-weight precision** and a
+case-drop bootstrap for **centrality stability**. Epskamp et al. (2018)
+recommend a CS-coefficient > 0.25 as a minimum threshold for interpretability
+and > 0.50 for strong confidence.
+
+## Edge-weight bootstrap
+
+```{r bootnet-edge, cache=TRUE}
+# ── Non-parametric edge-weight bootstrap ─────────────────────────────────────
+# Resamples respondents with replacement (1,000 iterations) to estimate the
+# confidence interval around each edge weight. A narrow CI indicates the edge
+# is estimated precisely; wide overlap between two edges' CIs indicates that
+# their relative ordering is uncertain.
+#
+# Statistics requested:
+#   "edge"     : bootstrapped CI for each individual edge weight
+#   "strength" : bootstrapped CI for node strength (sum of |edge weights|)
+#
+# nCores = 1: avoids parallel processing issues on some systems; increase to
+#   nCores = parallel::detectCores() - 1 to speed up if needed.
+#
+# NOTE: This chunk takes 1–3 minutes on a modern laptop (cache = TRUE).
+
+set.seed(4246)
+boot_edge <- bootnet(stars_matrix, nBoots = 1000, nCores = 1,
+                     type       = "nonparametric",
+                     statistics = c("edge", "strength"))
+
+# Preview the first 10 rows of edge-weight bootstrap summary
+summary(boot_edge, statistics = "edge")[1:10, ]
+```
+
+A narrow bootstrapped CI around an edge indicates that the edge weight is
+estimated precisely; large overlap between the CIs of two edges means their
+relative ordering is uncertain.
+
+## Centrality stability (case-drop bootstrap)
+
+```{r bootnet-case, cache=TRUE}
+# ── Case-drop centrality stability ───────────────────────────────────────────
+# Progressively removes respondents (in 10% increments) and re-estimates the
+# network on each subsample (1,000 iterations per step). corStability()
+# computes the CS-coefficient for each centrality measure: the largest
+# fraction of cases that can be dropped while maintaining r ≥ 0.70 between
+# the subsample centrality ordering and the full-sample ordering.
+#
+# Thresholds (Epskamp et al., 2018):
+#   CS > 0.50 : strong confidence in centrality ordering
+#   CS > 0.25 : minimum threshold for interpretability
+#   CS ≤ 0.25 : rankings should NOT be interpreted
+#
+# Expected result here: CS ≈ 0.00 for betweenness and closeness, 0.053 for
+# strength — all below 0.25. This is a known consequence of the low n/p ratio
+# (132 respondents / 51 items ≈ 2.6). Removing even a small number of
+# respondents makes the partial-correlation matrix non-positive-definite,
+# preventing re-estimation. Interpret individual node rankings descriptively only.
+#
+# NOTE: This chunk takes 2–5 minutes (cache = TRUE).
+
+set.seed(4246)
+boot_case <- bootnet(stars_matrix, nBoots = 1000, nCores = 1,
+                     type       = "case",
+                     statistics = c("strength", "betweenness", "closeness"))
+
+# CS-coefficient: one value per centrality measure
+cs_coef <- corStability(boot_case)
+cs_coef
+```
+
+The CS-coefficient is the largest proportion of cases that can be dropped
+while maintaining a correlation of at least 0.70 (with 95% probability)
+between the centrality ordering in the subsample and the full sample.
+Betweenness is known to be less stable than strength in small-sample
+psychometric networks (Bringmann et al., 2019); results based on betweenness
+should be interpreted with this caveat in mind.
+
+---
+
+# Figures for the report
+
+```{r setup-figures}
+# ── Shared aesthetics used across all three panels of Figure 1 ───────────────
+# Saving figures to figures/ keeps the working directory tidy and makes it
+# easy for a marker to locate all visual outputs.
+dir.create("figures", showWarnings = FALSE)
+
+# Colour palette: one distinctive colour per STARS domain.
+# These same colours are used in Figure 1 (igraph plots) and Figure 2 (ggplot).
+domain_colors <- c(
+  "Test and Class Anxiety"       = "#E41A1C",
+  "Interpretation Anxiety"       = "#377EB8",
+  "Fear of Asking for Help"      = "#4DAF4A",
+  "Worth of Statistics"          = "#984EA3",
+  "Computation Self-Concept"     = "#FF7F00",
+  "Fear of Statistics Teachers"  = "#FFD700"
+)
+
+# Fruchterman–Reingold layout — positions are fixed with set.seed(4246) so
+# all three panels of Figure 1 share the same spatial coordinates, enabling
+# direct visual comparison of domain vs. betweenness vs. bridge strength.
+set.seed(4246)
+layout_fr <- layout_with_fr(g, weights = E(g)$weight)
+
+# Node-size scaling helper:
+# Maps any positive numeric vector to the interval [min_size, max_size].
+# Used in panels b and c to scale node size by betweenness and bridge strength.
+scale_node <- function(x, min_size = 3, max_size = 14) {
+  if (max(x) == min(x)) return(rep((min_size + max_size) / 2, length(x)))
+  min_size + (x - min(x)) / (max(x) - min(x)) * (max_size - min_size)
+}
+
+size_btw  <- scale_node(centrality_tbl$betweenness)
+size_brid <- scale_node(centrality_tbl$bridge_strength)
+```
+
+## Figure 1 — Network topology panels (domain / betweenness / bridge strength)
+
+```{r figure-1}
+# ── Figure 1: Three-panel igraph visualisation ───────────────────────────────
+# All three panels share the same Fruchterman–Reingold layout so spatial
+# positions are directly comparable across panels.
+#
+# Panel (a): node colour = STARS domain.
+# Panel (b): node size ∝ betweenness centrality; labels shown for identification.
+# Panel (c): node size ∝ bridge strength; labels shown for identification.
+#
+# Edge width ∝ absolute partial correlation (E(g)$weight from absolutised matrix).
+# Edge colour: uniform grey (sign information is secondary to structural layout here).
+#
+# Saved as a high-resolution PNG (300 dpi) for inclusion in the report.
+
+vlabels <- V(g)$name
+
+# Re-compute layout and sizes here in case this chunk is run in isolation
+# (i.e., without the setup-figures chunk cached in the environment).
+set.seed(4246)
+layout_fr <- layout_with_fr(g, weights = E(g)$weight)
+
+scale_node <- function(x, min_size = 3, max_size = 14) {
+  if (max(x) == min(x)) return(rep((min_size + max_size) / 2, length(x)))
+  min_size + (x - min(x)) / (max(x) - min(x)) * (max_size - min_size)
+}
+size_btw  <- scale_node(centrality_tbl$betweenness)
+size_brid <- scale_node(centrality_tbl$bridge_strength)
+
+# Note: g was built from the absolutised matrix, so E(g)$weight is always > 0.
+# To recover edge sign for colouring, we would index back into stars_adj_mat,
+# but for this figure a uniform grey is used for visual clarity.
+edge_weights_raw <- stars_adj_mat[as_edgelist(g)]
+edge_colour <- ifelse(E(g)$weight > 0, "grey60", "#E07070")
+
+png("figures/Figure1_combined_network.png", width = 4800, height = 1800, res = 300)
+par(mfrow = c(1, 3), mar = c(1, 1, 3, 1))
+
+# Panel (a): colour by STARS domain
+plot(g, layout = layout_fr, vertex.label = NA, vertex.size = 7,
+     vertex.color = domain_colors[V(g)$domain], vertex.frame.color = "white",
+     edge.width = E(g)$weight * 6, edge.color = "grey80",
+     main = "(a) Network by STARS Domain")
+legend("bottomleft", legend = names(domain_colors), fill = domain_colors, bty = "n", cex = 0.7)
+
+# Panel (b): node size = betweenness centrality
+plot(g, layout = layout_fr, vertex.label = vlabels, vertex.size = size_btw,
+     vertex.color = domain_colors[V(g)$domain], vertex.frame.color = "white",
+     edge.width = E(g)$weight * 6, edge.color = "grey80",
+     main = "(b) Node size = Betweenness")
+
+# Panel (c): node size = bridge strength
+plot(g, layout = layout_fr, vertex.label = vlabels, vertex.size = size_brid,
+     vertex.color = domain_colors[V(g)$domain], vertex.frame.color = "white",
+     edge.width = E(g)$weight * 6, edge.color = "grey80",
+     main = "(c) Node size = Bridge Strength")
+
+dev.off()
+
+# Display the saved figure inline in the rendered HTML document.
+knitr::include_graphics("figures/Figure1_combined_network.png")
+```
+
+## Figure 2 — Standardised centrality z-scores by node
+
+```{r figure-2, fig.width=9, fig.height=5}
+# ── Figure 2: Lollipop chart of standardised centrality z-scores ─────────────
+# Standardises betweenness and bridge strength to z-scores so the two measures
+# can be displayed on comparable scales within a faceted plot.
+#
+# Nodes are ordered by their mean z-score (across measures) via reorder(),
+# placing the most central nodes at the top of each panel.
+#
+# Colour = STARS domain, matching Figure 1.
+# The item t_s ("too slow", CSC, orange) is expected to appear at the top of
+# both panels, as reported in the paper.
+
+centrality_std <- centrality_tbl |>
+  mutate(
+    btw_z  = as.numeric(scale(betweenness)),
+    bstr_z = as.numeric(scale(bridge_strength))
+  )
+
+plot_data2 <- centrality_std |>
+  select(node, domain, btw_z, bstr_z) |>
+  pivot_longer(cols      = c(btw_z, bstr_z),
+               names_to  = "measure",
+               values_to = "z_score") |>
+  mutate(
+    measure = case_when(
+      measure == "btw_z"  ~ "Betweenness centrality",
+      measure == "bstr_z" ~ "Bridge strength",
+      TRUE ~ measure
+    ),
+    node = reorder(node, z_score, FUN = mean)
+  )
+
+p3 <- ggplot(plot_data2,
+             aes(x = node, y = z_score, colour = domain)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey70") +
+  geom_segment(aes(xend = node, y = 0, yend = z_score),
+               colour = "grey80", linewidth = 0.4) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ measure, scales = "free_x") +
+  scale_colour_manual(values = domain_colors, name = "Domain") +
+  coord_flip() +
+  labs(x = NULL, y = "Standardized centrality (z)", title = NULL) +
+  theme_classic(base_size = 10) +
+  theme(
+    axis.text.y     = element_text(size = 7),
+    legend.position = "bottom",
+    legend.text     = element_text(size = 8),
+    strip.text      = element_text(face = "plain", size = 10)
+  ) +
+  guides(colour = guide_legend(nrow = 2, override.aes = list(size = 3)))
+
+ggsave("figures/Figure2_centrality_by_node.png",
+       plot = p3, width = 9, height = 7, dpi = 300)
+p3
+```
+
+---
+
+# Save outputs
+
+```{r save-outputs}
+# ── Create output directories ────────────────────────────────────────────────
+# tables/ : CSV exports of all four results tables (reproducible without re-running)
+# output/ : saved R objects for the marker to load directly (avoids re-running
+#           the slow estimation pipeline)
+dir.create("tables", showWarnings = FALSE)
+dir.create("output", showWarnings = FALSE)
+
+# ── Tables (CSV) ─────────────────────────────────────────────────────────────
+# Table 1 (macro_results)     : overall network descriptives
+# Table 2 (domain_summary)    : domain size and mean degree
+# Table 3 (domain_centrality) : domain-level centrality means (Table 2 in paper)
+# Table 4 (centrality_tbl)    : full node-level centrality measures
+write.csv(macro_results,     "tables/Table1_macro_results.csv",     row.names = FALSE)
+write.csv(domain_summary,    "tables/Table2_domain_summary.csv",    row.names = FALSE)
+write.csv(domain_centrality, "tables/Table3_domain_centrality.csv", row.names = FALSE)
+write.csv(centrality_tbl,    "tables/Table4_node_centrality.csv",   row.names = FALSE)
+
+# ── R objects (RDS) ──────────────────────────────────────────────────────────
+# stars_igraph.rds   : igraph object (absolute weights, domain attributes)
+# stars_bootnet.rds  : bootnet network object (needed to re-run bootnet plots)
+# bridge_results.rds : full bridge() output (all four bridge measures)
+#
+# A marker can load any of these with:
+#   g              <- readRDS("output/stars_igraph.rds")
+#   stars_matrix   <- readRDS("output/stars_bootnet.rds")
+#   bridge_results <- readRDS("output/bridge_results.rds")
+saveRDS(g,              "output/stars_igraph.rds")
+saveRDS(stars_matrix,   "output/stars_bootnet.rds")
+saveRDS(bridge_results, "output/bridge_results.rds")
+
+# ── Session info ─────────────────────────────────────────────────────────────
+# Records the exact R version and package versions used, supporting
+# reproducibility. Also displayed at the end of this document.
+writeLines(capture.output(sessionInfo()), "output/sessionInfo.txt")
+```
+
+---
+
+# Session info
+
+```{r session-info}
+# Prints the full R session info to confirm package versions.
+# The saved copy in output/sessionInfo.txt serves the same purpose for a marker
+# who downloads the repository without rendering the Rmd.
+sessionInfo()
+```
+
+---
+
+# References
+
+- Borsboom, D., & Cramer, A. O. J. (2013). Network analysis: An integrative approach to the structure of psychopathology. *Annual Review of Clinical Psychology, 9*, 91–121.
+- Bringmann, L. F., Elmer, T., Epskamp, S., Krause, R. W., Schoch, D., Wichers, M., Wigman, J. T. W., & Snippe, E. (2019). What do centrality measures measure in psychological networks? *Journal of Abnormal Psychology, 128*(8), 892–903.
+- Cruise, R. J., Cash, R. W., & Bolton, D. L. (1985). Development and validation of an instrument to measure statistical anxiety. *Proceedings of the American Statistical Association, Section on Statistical Education*, 92–97.
+- Epskamp, S., Borsboom, D., & Fried, E. I. (2018). Estimating psychological networks and their accuracy: A tutorial paper. *Behavior Research Methods, 50*, 195–212.
+- Hanna, D., Shevlin, M., & Dempster, M. (2008). The structure of the Statistics Anxiety Rating Scale: A confirmatory factor analysis using UK psychology students. *Personality and Individual Differences, 45*, 68–74.
+- Jones, P. J., Ma, R., & McNally, R. J. (2021). Bridge centrality: A network approach to understanding comorbidity. *Multivariate Behavioral Research, 56*(2), 353–367.
+- Marin, M. [MarinStatsLectures-R Programming & Statistics]. (2019, April 10). Permutation hypothesis testing with example | Statistics tutorial # 37 | MarinStatsLectures [Video]. YouTube. https://www.youtube.com/watch?v=rJ3AZCQuiLw
+- Marin, M. [MarinStatsLectures-R Programming & Statistics]. (2019, May 9). Permutation hypothesis test in R with examples | R tutorial 4.6 | MarinStatsLectures [Video]. YouTube. https://www.youtube.com/watch?v=xRzEWLfEEIA
+- Onwuegbuzie, A. J., & Wilson, V. A. (2003). Statistics anxiety: Nature, etiology, antecedents, effects, and treatments. *Teaching in Higher Education, 8*(2), 195–209.
+- Siew, C. S. Q. (2026). *Introduction to Network Analysis in igraph* [Course textbook]. National University of Singapore.
+- Siew, C. S. Q., McCartney, M. J., & Vitevitch, M. S. (2019). Using network science to understand statistics anxiety among college students. *Scholarship of Teaching and Learning in Psychology, 5*, 75–89.
+
+
+---
+
+# AI Tool Declaration
+
+**Claude (Anthropic)** was used in the preparation of this Rmd file in the following ways:
+
+- Brainstorming the research question and identifying relevant bridge centrality measures.
+- Explaining R errors encountered during network estimation and bootnet bootstrapping.
+- Suggesting appropriate analyses after assumption of normality was not met and non-parametric measures were needed
+- Double-checking code logic
+- Suggested edits for the comments on the Rmd file for clarity and consistency
+- Suggested edits for concision in section headers and prose explanations within the Rmd.
+
+All analytical decisions, all interpretations, and the final structure of the script are my own. I am fully responsible for the accuracy and content of this repository.
